@@ -32,7 +32,9 @@ class Database {
 
     private boolean canStop = false;
 
-    private boolean savePagesRunning = false;
+    private GetPagesThread getPagesThread;
+
+    private SavePagesThread savePagesThread;
 
     Database() {
         File file = new File(dbFile);
@@ -105,15 +107,14 @@ class Database {
     }
 
     synchronized void addPage(String url) {
-        if (!this.savePagesRunning
-                && (this.addPageQueue.size() > 10000 || this.getPageQueue.isEmpty())) {
-            this.savePagesRunning = true;
-            new SavePagesThread().start();
+        if (this.savePagesThread == null || !this.savePagesThread.isAlive()) {
+            this.savePagesThread = new SavePagesThread();
+            this.savePagesThread.start();
         }
 
         while (this.addPageQueue.size() > 50000) {
             try {
-                this.wait();
+                wait();
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
@@ -176,38 +177,17 @@ class Database {
      * @return
      */
     synchronized String getPage() {
-        int count;
-        int limit = 1000;
-        if (getPageQueue.size() <= 500) {
-            synchronized (c) {
-                count = loadPages(limit, "cz", true); // zaklad jsou cz domeny
-
-                if (count < limit) { // sk domeny
-                    count += loadPages(limit - count, "sk", true);
-                }
-
-                if (count < limit) { // eu domeny
-                    count += loadPages(limit - count, "eu", true);
-                }
-
-                if (count < limit) { // zbytek světa bez subdomen
-                    count += loadPages(limit - count, null, true);
-                }
-
-                if (count < limit) { // zbytek světa se subdomenami
-                    count += loadPages(limit - count, null, false);
-                }
-            }
-
-            if (count == 0) {
-                System.err.println("\nCan stop is TRUE !!!\n");
-                this.canStop = true;
-            } else {
-                this.canStop = false;
-            }
+        if (this.getPagesThread == null || !this.getPagesThread.isAlive()) {
+            this.getPagesThread = new GetPagesThread();
+            this.getPagesThread.start();
         }
+
         Url url = (Url) getPageQueue.poll();
-        return url == null ? null : url.url;
+        if (url == null) {
+            return null;
+        } else {
+            return url.url;
+        }
     }
 
     void generateReport() {
@@ -458,37 +438,43 @@ class Database {
 
     private class SavePagesThread extends Thread {
 
-        private long now;
+        private long start;
 
         @Override
         public void run() {
-            synchronized (c) {
-                now = System.currentTimeMillis();
-                try {
-                    long start = System.currentTimeMillis();
-                    int count = 0;
-                    c.setAutoCommit(false);
+            while (true) {
+                while (Database.this.addPageQueue.size() < 10000 && !Database.this.getPageQueue.isEmpty()) {
+                    try {
+                        sleep(100);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+                synchronized (c) {
+                    start = System.currentTimeMillis();
+                    try {
+                        int count = 0;
+                        c.setAutoCommit(false);
 
-                    String url;
-                    while ((url = (String) addPageQueue.poll()) != null) {
-                        add(url);
-                        count++;
+                        String url;
+                        while ((url = (String) addPageQueue.poll()) != null) {
+                            add(url);
+                            count++;
 
-                        if (count % 10000 == 0) {
-                            c.commit();
+                            if (count % 10000 == 0) {
+                                c.commit();
+                            }
                         }
-                    }
 
-                    c.commit();
-                    c.setAutoCommit(true);
+                        c.commit();
+                        c.setAutoCommit(true);
 
-                    if (WebAnalyzer.debug) {
-                        System.out.println("\nAdd pages " + (System.currentTimeMillis() - start) + "ms, " + count + " items");
+                        if (WebAnalyzer.debug) {
+                            System.out.println("\nAdd pages " + (System.currentTimeMillis() - start) + "ms, " + count + " items");
+                        }
+                    } catch (SQLException ex) {
+                        Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex);
                     }
-                } catch (SQLException ex) {
-                    Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex);
-                } finally {
-                    savePagesRunning = false;
                 }
             }
         }
@@ -534,13 +520,55 @@ class Database {
                 stmt.setBoolean(1, secured);
                 stmt.setString(2, url);
                 stmt.setBoolean(3, isSubdomain);
-                stmt.setLong(4, now);
+                stmt.setLong(4, start);
                 stmt.execute();
             } catch (URISyntaxException ex) {
 //            System.err.println("Spatna adresa " + url);
             } catch (SQLException ex) {
                 if (ex.getErrorCode() != SQLITE_CONSTRAINT) {
                     Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex);
+                }
+            }
+        }
+    }
+
+    private class GetPagesThread extends Thread {
+        @Override
+        public void run() {
+            while (true) {
+                while (Database.this.getPageQueue.size() > 5000) {
+                    try {
+                        sleep(1000);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+
+                int count;
+                int limit = 10000;
+
+                synchronized (c) {
+                    count = loadPages(limit, "cz", true); // zaklad jsou cz domeny
+
+                    if (count < limit) { // sk domeny
+                        count += loadPages(limit - count, "sk", true);
+                    }
+
+                    if (count < limit) { // eu domeny
+                        count += loadPages(limit - count, "eu", true);
+                    }
+
+                    if (count < limit) { // zbytek světa bez subdomen
+                        count += loadPages(limit - count, null, true);
+                    }
+
+                    if (count < limit) { // zbytek světa se subdomenami
+                        count += loadPages(limit - count, null, false);
+                    }
+                }
+
+                if (WebAnalyzer.debug) {
+                    System.out.println("Loaded " + count + " pages");
                 }
             }
         }
