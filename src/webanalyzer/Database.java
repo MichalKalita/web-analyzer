@@ -105,13 +105,21 @@ class Database {
     }
 
     synchronized void addPage(String url) {
-        this.addPageQueue.add(url);
-
         if (!this.savePagesRunning
-                && (this.addPageQueue.size() > 1000 || this.getPageQueue.isEmpty())) {
+                && (this.addPageQueue.size() > 10000 || this.getPageQueue.isEmpty())) {
             this.savePagesRunning = true;
             new SavePagesThread().start();
         }
+
+        while (this.addPageQueue.size() > 50000) {
+            try {
+                this.wait();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+
+        this.addPageQueue.add(url);
     }
 
     void updatePage(String url, boolean useNette, boolean error) {
@@ -465,6 +473,10 @@ class Database {
                     while ((url = (String) addPageQueue.poll()) != null) {
                         add(url);
                         count++;
+
+                        if (count % 10000 == 0) {
+                            c.commit();
+                        }
                     }
 
                     c.commit();
