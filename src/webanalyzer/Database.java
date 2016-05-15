@@ -24,11 +24,15 @@ class Database {
 
     private Connection c;
 
-    private ConcurrentLinkedQueue getPageCache;
+    private ConcurrentLinkedQueue getPageQueue;
+
+    private ConcurrentLinkedQueue addPageQueue;
 
     private String dbFile = "web-analyzer.db";
 
     private boolean canStop = false;
+
+    private boolean savePagesRunning = false;
 
     Database() {
         File file = new File(dbFile);
@@ -38,23 +42,38 @@ class Database {
             Class.forName("org.sqlite.JDBC");
             this.c = DriverManager.getConnection("jdbc:sqlite:" + dbFile);
 
+            Statement stmt = c.createStatement();
+            stmt.execute("PRAGMA cache_size = -100000"); // 100MB cache
+            stmt.execute("PRAGMA synchronous = OFF");
+            stmt.close();
         } catch (Exception e) {
             System.err.println(e.getClass().getName() + ": " + e.getMessage());
             System.exit(0);
         }
 
-        this.getPageCache = new ConcurrentLinkedQueue();
+        this.getPageQueue = new ConcurrentLinkedQueue();
+        this.addPageQueue = new ConcurrentLinkedQueue();
 
         if (installed) {
             System.out.println("Database is already installed");
         } else {
             System.out.println("Installing database ...");
             install();
-            getPageCache.add(new Url("http://nette.org"));
-            getPageCache.add(new Url("http://lydragos.cz"));
-            getPageCache.add(new Url("https://gist.githubusercontent.com/Myiyk/7589213/raw/fcbff4625313e9c4f224177ecf02a27d745c788c/Soupis%20webů%20s%20Nette%20Framework"));
+            getPageQueue.add(new Url("http://nette.org"));
+            getPageQueue.add(new Url("http://lydragos.cz"));
+            getPageQueue.add(new Url("https://gist.githubusercontent.com/Myiyk/7589213/raw/fcbff4625313e9c4f224177ecf02a27d745c788c/Soupis%20webů%20s%20Nette%20Framework"));
         }
         System.out.println("Database connected");
+    }
+
+    private static String humanReadableByteCount(long bytes, boolean si) {
+        int unit = si ? 1000 : 1024;
+        if (bytes < unit) {
+            return bytes + " B";
+        }
+        int exp = (int) (Math.log(bytes) / Math.log(unit));
+        String pre = (si ? "kMGTPE" : "KMGTPE").charAt(exp - 1) + (si ? "" : "i");
+        return String.format("%.1f %sB", bytes / Math.pow(unit, exp), pre);
     }
 
     private void install() {
@@ -85,66 +104,13 @@ class Database {
         }
     }
 
-    void addPage(String url) {
-        PreparedStatement stmt = null;
-        boolean isSubdomain;
-        try {
-            URI uri = new URI(url);
+    synchronized void addPage(String url) {
+        this.addPageQueue.add(url);
 
-            String scheme = uri.getScheme();
-            boolean secured;
-
-            if (scheme == null) {
-                return;
-            }
-            switch (scheme) {
-                case "https":
-                    secured = true;
-                    break;
-                case "http":
-                    secured = false;
-                    break;
-                default:
-                    return;
-            }
-
-            url = uri.getHost();
-            if (url == null) {
-                return;
-            }
-            String domain = url.substring(url.lastIndexOf('.', url.lastIndexOf('.') - 1) + 1);
-            if (url.equals(domain)) { // address is domain, not subdomain
-                isSubdomain = false;
-            } else {
-                // subdomain is www, it is domain
-                if (url.substring(0, url.length() - domain.length()).equals("www.")) {
-                    isSubdomain = false;
-                } else { // subdomain isnt www, it is subdomain
-                    isSubdomain = true;
-                }
-            }
-
-            String sql = "INSERT INTO pages (secured, url, isSubdomain, dateAdded) "
-                    + "VALUES (?, ?, ?, ?);";
-            stmt = c.prepareStatement(sql);
-            stmt.setBoolean(1, secured);
-            stmt.setString(2, url);
-            stmt.setBoolean(3, isSubdomain);
-            stmt.setLong(4, System.currentTimeMillis());
-            stmt.executeUpdate();
-        } catch (URISyntaxException ex) {
-//            System.err.println("Spatna adresa " + url);
-        } catch (SQLException ex) {
-            if (ex.getErrorCode() != SQLITE_CONSTRAINT) {
-                Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex);
-            }
-        } finally {
-            if (stmt != null) {
-                try {
-                    stmt.close();
-                } catch (SQLException ignored) {
-                }
-            }
+        if (!this.savePagesRunning
+                && (this.addPageQueue.size() > 1000 || this.getPageQueue.isEmpty())) {
+            this.savePagesRunning = true;
+            new SavePagesThread().start();
         }
     }
 
@@ -174,13 +140,15 @@ class Database {
                     + "error = ?, "
                     + "dateComputed = ? "
                     + "WHERE secured = ? AND url = ?;";
-            stmt = c.prepareStatement(sql);
-            stmt.setBoolean(1, useNette);
-            stmt.setBoolean(2, error);
-            stmt.setLong(3, System.currentTimeMillis());
-            stmt.setBoolean(4, secured);
-            stmt.setString(5, url);
-            stmt.executeUpdate();
+            synchronized (c) {
+                stmt = c.prepareStatement(sql);
+                stmt.setBoolean(1, useNette);
+                stmt.setBoolean(2, error);
+                stmt.setLong(3, System.currentTimeMillis());
+                stmt.setBoolean(4, secured);
+                stmt.setString(5, url);
+                stmt.executeUpdate();
+            }
 
         } catch (URISyntaxException | SQLException ex) {
             Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex);
@@ -202,20 +170,27 @@ class Database {
     synchronized String getPage() {
         int count;
         int limit = 1000;
-        if (getPageCache.size() <= 500) {
-            count = loadPages(limit, "cz", true); // zaklad jsou cz domeny
+        if (getPageQueue.size() <= 500) {
+            synchronized (c) {
+                count = loadPages(limit, "cz", true); // zaklad jsou cz domeny
 
-            if (count < limit) { // sk domeny
-                count += loadPages(limit - count, "sk", true);
+                if (count < limit) { // sk domeny
+                    count += loadPages(limit - count, "sk", true);
+                }
+
+                if (count < limit) { // eu domeny
+                    count += loadPages(limit - count, "eu", true);
+                }
+
+                if (count < limit) { // zbytek světa bez subdomen
+                    count += loadPages(limit - count, null, true);
+                }
+
+                if (count < limit) { // zbytek světa se subdomenami
+                    count += loadPages(limit - count, null, false);
+                }
             }
 
-            if (count < limit) { // eu domeny
-                count += loadPages(limit - count, "eu", true);
-            }
-
-            if (count < limit) { // zbytek světa
-                count += loadPages(limit - count, null, false);
-            }
             if (count == 0) {
                 System.err.println("\nCan stop is TRUE !!!\n");
                 this.canStop = true;
@@ -223,7 +198,7 @@ class Database {
                 this.canStop = false;
             }
         }
-        Url url = (Url) getPageCache.poll();
+        Url url = (Url) getPageQueue.poll();
         return url == null ? null : url.url;
     }
 
@@ -362,9 +337,9 @@ class Database {
 
         try {
             stmt = c.createStatement();
-            rs = stmt.executeQuery("SELECT DISTINCT *, LOWER(REPLACE(url, 'www.', '')) as domain FROM pages " +
-                    "WHERE useNette = 1 AND isSubdomain = 0 " +
-                    "ORDER BY domain LIMIT 10000000");
+            rs = stmt.executeQuery("SELECT DISTINCT *, LOWER(REPLACE(url, 'www.', '')) as domain FROM pages "
+                    + "WHERE useNette = 1 AND isSubdomain = 0 "
+                    + "ORDER BY domain LIMIT 10000000");
 
             while (rs.next()) {
                 actualSecured = rs.getBoolean("secured");
@@ -374,8 +349,8 @@ class Database {
                 if (actualAddress.replace("www.", "").equals(previousAddress)) { // actual has www.
                     System.out.println((previousSecured ? "https" : "http") + "://" + previousAddress);
                     actualPrinted = true;
-                } else if (previousAddress.replace("www.", "").equals(actualAddress) ||
-                        previousAddress.equals(actualAddress)) { // previous has www. || previous is same as actual
+                } else if (previousAddress.replace("www.", "").equals(actualAddress)
+                        || previousAddress.equals(actualAddress)) { // previous has www. || previous is same as actual
                     System.out.println((actualSecured || previousSecured ? "https" : "http") + "://" + actualAddress);
                     actualPrinted = true;
                 } else if (!previousPrinted) { // nobody have www, previous is other
@@ -393,40 +368,6 @@ class Database {
         }
     }
 
-    private class Url {
-
-        Integer id;
-        String url;
-
-        Url() {
-
-        }
-
-        public Url(Integer id, String url) {
-            this.id = id;
-            this.url = url;
-        }
-
-        Url(String url) {
-            this.id = -1;
-            this.url = url;
-        }
-    }
-
-    private static String humanReadableByteCount(long bytes, boolean si) {
-        int unit = si ? 1000 : 1024;
-        if (bytes < unit) {
-            return bytes + " B";
-        }
-        int exp = (int) (Math.log(bytes) / Math.log(unit));
-        String pre = (si ? "kMGTPE" : "KMGTPE").charAt(exp - 1) + (si ? "" : "i");
-        return String.format("%.1f %sB", bytes / Math.pow(unit, exp), pre);
-    }
-
-    public boolean iCanStop() {
-        return canStop;
-    }
-
     private int loadPages(int limit, String domain, boolean withoutSubdomain) {
         Statement stmt;
         ResultSet rs;
@@ -436,8 +377,8 @@ class Database {
         StringBuilder sql;
         Integer count = 0;
 
-        if (!getPageCache.isEmpty()) {
-            iterator = getPageCache.iterator();
+        if (!getPageQueue.isEmpty()) {
+            iterator = getPageQueue.iterator();
             StringJoiner sj = new StringJoiner(", ");
             while (iterator.hasNext()) {
                 url = (Url) iterator.next();
@@ -474,7 +415,7 @@ class Database {
 
                 url.url = (secured ? "https" : "http") + "://" + address;
 
-                getPageCache.add(url);
+                getPageQueue.add(url);
 
                 count = rs.getRow();
             }
@@ -485,5 +426,111 @@ class Database {
         }
 
         return count;
+    }
+
+    private class Url {
+
+        Integer id;
+        String url;
+
+        Url() {
+
+        }
+
+        public Url(Integer id, String url) {
+            this.id = id;
+            this.url = url;
+        }
+
+        Url(String url) {
+            this.id = -1;
+            this.url = url;
+        }
+    }
+
+    private class SavePagesThread extends Thread {
+
+        private long now;
+
+        @Override
+        public void run() {
+            synchronized (c) {
+                now = System.currentTimeMillis();
+                try {
+                    long start = System.currentTimeMillis();
+                    int count = 0;
+                    c.setAutoCommit(false);
+
+                    String url;
+                    while ((url = (String) addPageQueue.poll()) != null) {
+                        add(url);
+                        count++;
+                    }
+
+                    c.commit();
+                    c.setAutoCommit(true);
+
+                    if (WebAnalyzer.debug) {
+                        System.out.println("\nAdd pages " + (System.currentTimeMillis() - start) + "ms, " + count + " items");
+                    }
+                } catch (SQLException ex) {
+                    Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex);
+                } finally {
+                    savePagesRunning = false;
+                }
+            }
+        }
+
+        private void add(String url) {
+            boolean isSubdomain;
+            try {
+                URI uri = new URI(url);
+
+                String scheme = uri.getScheme();
+                boolean secured;
+
+                if (scheme == null) {
+                    return;
+                }
+                switch (scheme) {
+                    case "https":
+                        secured = true;
+                        break;
+                    case "http":
+                        secured = false;
+                        break;
+                    default:
+                        return;
+                }
+
+                url = uri.getHost();
+                if (url == null) {
+                    return;
+                }
+                String domain = url.substring(url.lastIndexOf('.', url.lastIndexOf('.') - 1) + 1);
+                if (url.equals(domain)) { // address is domain, not subdomain
+                    isSubdomain = false;
+                } else // subdomain is www, it is domain
+                    if (url.substring(0, url.length() - domain.length()).equals("www.")) {
+                        isSubdomain = false;
+                    } else { // subdomain isnt www, it is subdomain
+                        isSubdomain = true;
+                    }
+
+                PreparedStatement stmt = c.prepareStatement("INSERT INTO pages (secured, url, isSubdomain, dateAdded) "
+                        + "VALUES (?, ?, ?, ?);");
+                stmt.setBoolean(1, secured);
+                stmt.setString(2, url);
+                stmt.setBoolean(3, isSubdomain);
+                stmt.setLong(4, now);
+                stmt.execute();
+            } catch (URISyntaxException ex) {
+//            System.err.println("Spatna adresa " + url);
+            } catch (SQLException ex) {
+                if (ex.getErrorCode() != SQLITE_CONSTRAINT) {
+                    Logger.getLogger(Database.class.getName()).log(Level.SEVERE, null, ex);
+                }
+            }
+        }
     }
 }

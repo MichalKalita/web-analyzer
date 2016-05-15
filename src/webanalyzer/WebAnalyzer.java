@@ -10,11 +10,11 @@ package webanalyzer;
  */
 public class WebAnalyzer {
 
-    private Database database;
+    public static boolean debug = false;
 
     public static void main(String[] args) {
         int threads = 10;
-        boolean export = false;
+        boolean export = false, report = false;
 
         if (args.length > 0) {
             for (int i = 0; i < args.length; i++) {
@@ -30,6 +30,12 @@ public class WebAnalyzer {
                     case "--export":
                         export = true;
                         break;
+                    case "--report":
+                        report = true;
+                        break;
+                    case "--debug":
+                        debug = true;
+                        break;
                     default:
                         System.out.println("Not recognized parameter " + args[i]);
                         break;
@@ -39,28 +45,16 @@ public class WebAnalyzer {
 
         if (export) {
             new Database().export();
+        } else if(report) {
+            new Database().generateReport();
         } else {
+            System.out.println(threads + " threads");
             new WebAnalyzer(threads);
         }
     }
 
     public WebAnalyzer(int countOfThreads) {
-        database = new Database();
-
-        Thread report = new Thread() {
-            public void run() {
-                try {
-                    while (true) {
-                        database.generateReport();
-                        Thread.sleep(30 * 1000); // sleep 30 seconds and make report
-                    }
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-                }
-            }
-        };
-        report.setDaemon(true);
-        report.start();
+        Database database = new Database();
 
         Thread[] threads = new Thread[countOfThreads];
         for (int i = 0; i < threads.length; i++) {
